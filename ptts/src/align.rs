@@ -4,8 +4,7 @@
 //! 12.5 Hz Phonon codec). While generating, the new frame's query attends over the text
 //! tokens sitting in the KV cache. [`crate::transformer::TextSpan`] reads that row, averaged
 //! over the heads of one layer. [`WordClock`] walks the rows monotonically — at most one
-//! text token forward per frame, and only when the next token's weight exceeds the current
-//! one's — and turns the path into [`WordTiming`]s for the words of the caller's text.
+//! text token forward per frame, and only when a later token outweighs the current one — and turns the path into [`WordTiming`]s for the words of the caller's text.
 //!
 //! The walk is the one the browser highlighter this was built from used, and it is
 //! prefix-stable: a word's time does not move once it has been emitted, so timings can be
@@ -194,15 +193,28 @@ impl WordClock {
 
 /// The token a frame attends, given the token the previous frame attended.
 ///
-/// Stays put, or moves one token forward when that token's weight is the larger of the two.
-/// An empty row leaves `prev` unchanged.
+/// Stays, or moves one token forward. The neighbour wins when it is the heavier of the two.
+/// A lighter neighbour is still crossed when some later token is the peak and heavier than the
+/// current one: a punctuation piece between two words is lighter than either, and refusing to
+/// step onto it pins the walk to the first word. An empty row leaves `prev` unchanged.
 pub fn step_token(prev: usize, row: &[f32]) -> usize {
     if row.is_empty() {
         return prev;
     }
     let prev = prev.min(row.len() - 1);
-    let next = (prev + 1).min(row.len() - 1);
-    if next != prev && row[next] > row[prev] { next } else { prev }
+    if prev + 1 >= row.len() {
+        return prev;
+    }
+    if row[prev + 1] > row[prev] {
+        return prev + 1;
+    }
+    let mut peak = prev;
+    for (index, weight) in row.iter().enumerate().skip(prev + 1) {
+        if *weight > row[peak] {
+            peak = index;
+        }
+    }
+    if peak > prev { prev + 1 } else { prev }
 }
 
 fn secs(frame: usize, frame_rate: f64) -> f32 {
@@ -560,10 +572,12 @@ mod tests {
         assert_eq!(step_token(0, &[]), 0);
         assert_eq!(step_token(0, &[0.9, 0.1, 0.0]), 0);
         assert_eq!(step_token(0, &[0.4, 0.6, 0.0]), 1);
-        // Two tokens ahead does not skip: only the neighbour is eligible.
+        // The peak is two tokens ahead. The walk still moves one token at a time.
         assert_eq!(step_token(0, &[0.1, 0.2, 0.7]), 1);
         assert_eq!(step_token(1, &[0.1, 0.2, 0.7]), 2);
         assert_eq!(step_token(2, &[0.0, 0.0, 1.0]), 2);
+        // A light punctuation piece between two words must not pin the walk to the first.
+        assert_eq!(step_token(0, &[0.4, 0.05, 0.55]), 1);
     }
 
     #[test]
