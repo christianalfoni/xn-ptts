@@ -351,6 +351,65 @@ impl<Q: BackendQ> TTSModel<Q> {
         Ok((latent, is_eos))
     }
 
+    /// Where the text just prompted occupies the cache, and which layer to read it from.
+    ///
+    /// Call this once, after [`Self::prompt_text`] and before the first frame: the cache grows
+    /// with every frame, so a span taken later would point at audio. The middle layer is the
+    /// one [`crate::transformer::TextSpan::middle`] picks. An empty prompt has length 0, and
+    /// no attention row is computed for it.
+    pub fn text_span(&self, state: &TTSState<Q>, n_tokens: usize) -> crate::transformer::TextSpan {
+        let end = state.flow_lm_state.transformer_state.flow_len();
+        let start = end.saturating_sub(n_tokens);
+        let len = n_tokens.min(end - start);
+        crate::transformer::TextSpan::middle(start, len, self.flow_lm.transformer.layers.len())
+    }
+
+    /// As [`Self::generate_step_parts`], also returning the frame's text-attention row.
+    ///
+    /// The row stays on the device. [`Self::generate_step_parts`] is what runs when timings
+    /// were not asked for, and it does not compute one.
+    #[allow(clippy::type_complexity)]
+    pub fn generate_step_aligned(
+        &self,
+        state: &mut TTSState<Q>,
+        input: crate::flow_lm::StepInput<'_, Q>,
+        rng: &mut impl crate::flow_lm::Rng,
+        span: crate::transformer::TextSpan,
+    ) -> Result<(Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>)> {
+        self.flow_lm.sample_next_latent_aligned(
+            input,
+            &self.empty_text()?,
+            &mut state.flow_lm_state,
+            self.lsd_decode_steps,
+            rng,
+            span,
+        )
+    }
+
+    /// As [`Self::generate_step_cfg`], also returning the conditional branch's text attention.
+    #[allow(clippy::type_complexity)]
+    pub fn generate_step_cfg_aligned(
+        &self,
+        state: &mut TTSState<Q>,
+        null_state: &mut TTSState<Q>,
+        cfg_coef: f32,
+        input: crate::flow_lm::StepInput<'_, Q>,
+        rng: &mut impl crate::flow_lm::Rng,
+        span: crate::transformer::TextSpan,
+    ) -> Result<(Tensor<Q::T, Q::B>, bool, Tensor<Q::T, Q::B>)> {
+        self.flow_lm.sample_next_latent_cfg_aligned(
+            input,
+            &self.empty_text()?,
+            &mut state.flow_lm_state,
+            &mut null_state.flow_lm_state,
+            cfg_coef,
+            self.lsd_decode_steps,
+            rng,
+            self.eos_threshold,
+            span,
+        )
+    }
+
     /// Decode latent to audio using mimi (streaming).
     pub fn decode_latent(
         &self,

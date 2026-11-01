@@ -59,6 +59,27 @@ impl<T: WithDTypeF, B: Backend> StreamingMHAState<T, B> {
     }
 }
 
+/// Where the prompted text sits in a flow-LM key/value cache.
+///
+/// `start` is the first text token, after the voice prompt and any prefix sink, and `len` is
+/// how many text tokens follow. `layer` is which transformer layer's attention to read.
+/// [`TextSpan::middle`] uses the middle layer: for the six-layer Phonon checkpoints that is
+/// layer 3, which is where a text alignment is usually sharpest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextSpan {
+    pub start: usize,
+    pub len: usize,
+    pub layer: usize,
+}
+
+impl TextSpan {
+    /// A span read from the middle layer of a model with `layers` layers.
+    pub fn middle(start: usize, len: usize, layers: usize) -> Self {
+        let layer = if layers == 0 { 0 } else { layers / 2 };
+        Self { start, len, layer: layer.min(layers.saturating_sub(1)) }
+    }
+}
+
 /// Streaming multi-head attention (used by the flow LM transformer).
 pub struct StreamingMultiheadAttention<Q: BackendQ> {
     in_proj: Q::LinearQ,
@@ -99,6 +120,8 @@ impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
         Ok(StreamingMHAState { k_cache, v_cache, current_end: 0 })
     }
 
+    /// The plain forward, kept for the grouped-query test. Generation calls [`Self::forward_inner`].
+    #[cfg(test)]
     #[tracing::instrument(name = "attn", skip_all)]
     pub(crate) fn forward(
         &self,
@@ -107,6 +130,22 @@ impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
         state: &mut StreamingMHAState<Q::T, Q::B>,
         mask: Option<&Tensor<Q::T, Q::B>>,
     ) -> Result<Tensor<Q::T, Q::B>> {
+        Ok(self.forward_inner(query, rope, state, mask, None)?.0)
+    }
+
+    /// As [`Self::forward`]. When `probe` is set and this step is a single new frame, also
+    /// returns that frame's attention over the probed text tokens. `probe == None` computes
+    /// nothing beyond the ordinary forward: no extra matmul and no extra readback.
+    #[allow(clippy::type_complexity)]
+    #[tracing::instrument(name = "attn", skip_all)]
+    pub(crate) fn forward_inner(
+        &self,
+        query: &Tensor<Q::T, Q::B>,
+        rope: &RotaryEmbedding<Q::T, Q::B>,
+        state: &mut StreamingMHAState<Q::T, Q::B>,
+        mask: Option<&Tensor<Q::T, Q::B>>,
+        probe: Option<TextSpan>,
+    ) -> Result<(Tensor<Q::T, Q::B>, Option<Tensor<Q::T, Q::B>>)> {
         use xn::ModuleT;
         let (b, t, _) = query.dims3()?;
         let (h, kvh) = (self.num_heads, self.num_kv_heads);
@@ -135,8 +174,16 @@ impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
 
         let inv_sqrt_d = 1.0 / (d as f32).sqrt();
 
-        let x = if t == 1 {
-            q.sdpa_decode(&k, &v, mask, inv_sqrt_d)?
+        let (x, row) = if t == 1 {
+            // The row is the attention the model is about to use, scored the same way and
+            // then sliced to the text. It is computed only when a caller asked for it.
+            let row = match probe {
+                Some(span) if span.len > 0 => {
+                    Some(text_attention_row::<Q>(&q, &k, span, inv_sqrt_d)?)
+                }
+                _ => None,
+            };
+            (q.sdpa_decode(&k, &v, mask, inv_sqrt_d)?, row)
         } else {
             // Transpose to [b, h, t, d] for attention
             let q = q.transpose(1, 2)?;
@@ -154,10 +201,41 @@ impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
             let x = attn.matmul(&v)?;
 
             // Back to [b, t, h*d]
-            x.transpose(1, 2)?.reshape((b, t, self.attn_dim))?.contiguous()?
+            (x.transpose(1, 2)?.reshape((b, t, self.attn_dim))?.contiguous()?, None)
         };
-        self.out_proj.forward(&x)
+        Ok((self.out_proj.forward(&x)?, row))
     }
+}
+
+/// Mean attention of one new frame over the text tokens in `span`.
+///
+/// `q` is `[batch, 1, heads, dim]` and `k` is the filled cache, `[batch, keys, heads, dim]`.
+/// The softmax is over every cached key, voice prompt and earlier frames included, and the
+/// result keeps only the text positions, averaged over heads. Those weights do not sum to 1:
+/// the rest of the mass sits on the voice and on the frames already generated. The tensor
+/// stays on `q`'s device; a caller that wants it on the host reads it back with the audio.
+pub(crate) fn text_attention_row<Q: BackendQ>(
+    q: &Tensor<Q::T, Q::B>,
+    k: &TensorView<Q::T, Q::B>,
+    span: TextSpan,
+    scale: f32,
+) -> Result<Tensor<Q::T, Q::B>> {
+    let end = span.start + span.len;
+    let seq = k.dims().get(1).copied().unwrap_or(0);
+    if span.len == 0 || end > seq {
+        xn::bail!("text span {}..{end} does not fit the {seq} cached positions", span.start);
+    }
+    let heads = q.dim(2)?;
+    // [b, h, 1, d] against [b, h, keys, d], the same layout the prefill attention uses.
+    let q = q.transpose(1, 2)?;
+    let k = k.transpose(1, 2)?;
+    let probs = q.matmul_t(&k)?.scale(Q::T::from_f32(scale))?.softmax()?;
+    let text = probs.narrow(3, span.start..end)?.contiguous()?;
+    let mean = text.sum_keepdim(vec![1])?.scale(Q::T::from_f32(1.0 / heads as f32))?;
+    // [batch, 1, 1, len] -> [len], the first row of the batch. Generation runs at batch 1.
+    // Reshape the owned tensor: a view reshape only changes rank by one, and retrying it
+    // does not terminate.
+    mean.narrow(0, 0..1)?.contiguous()?.reshape(span.len)
 }
 // ---- KV Cache ----
 
@@ -283,6 +361,18 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformerState<T, B> {
             layer_states.push(copied);
         }
         Ok(Self { layer_states })
+    }
+
+    /// How many positions the flow-LM cache has filled. Every layer advances together, so the
+    /// first one says it for all of them. A state with no flow-LM layer reports 0.
+    pub fn flow_len(&self) -> usize {
+        self.layer_states
+            .iter()
+            .find_map(|layer| match layer {
+                LayerAttentionState::FlowLm(mha) => Some(mha.current_end),
+                LayerAttentionState::Mimi(_) => None,
+            })
+            .unwrap_or(0)
     }
 }
 
@@ -470,6 +560,7 @@ impl<Q: BackendQ> StreamingTransformerLayer<Q> {
         Ok(s)
     }
 
+    #[allow(clippy::type_complexity)]
     #[tracing::instrument(name = "transformer-layer", skip_all)]
     pub(crate) fn forward(
         &self,
@@ -477,17 +568,18 @@ impl<Q: BackendQ> StreamingTransformerLayer<Q> {
         rope: &RotaryEmbedding<Q::T, Q::B>,
         state: &mut LayerAttentionState<Q::T, Q::B>,
         mask: Option<&Tensor<Q::T, Q::B>>,
-    ) -> Result<Tensor<Q::T, Q::B>> {
+        probe: Option<TextSpan>,
+    ) -> Result<(Tensor<Q::T, Q::B>, Option<Tensor<Q::T, Q::B>>)> {
         use xn::ModuleT;
 
         // Self-attention block: x + layer_scale_1(attn(norm1(x)))
         let norm1 = self.norm1.forward(x)?;
-        let mut attn_out = match (&self.self_attn, state) {
+        let (mut attn_out, row) = match (&self.self_attn, state) {
             (AttentionKind::Mimi(attn), LayerAttentionState::Mimi(cache)) => {
-                attn.forward(&norm1, rope, cache, mask)?
+                (attn.forward(&norm1, rope, cache, mask)?, None)
             }
             (AttentionKind::FlowLm(attn), LayerAttentionState::FlowLm(mha_state)) => {
-                attn.forward(&norm1, rope, mha_state, mask)?
+                attn.forward_inner(&norm1, rope, mha_state, mask, probe)?
             }
             _ => xn::bail!("attention kind and state type mismatch"),
         };
@@ -507,7 +599,7 @@ impl<Q: BackendQ> StreamingTransformerLayer<Q> {
         if let Some(ls) = &self.layer_scale_2 {
             ff_out = ls.forward(&ff_out)?;
         }
-        x.add(&ff_out)
+        Ok((x.add(&ff_out)?, row))
     }
 }
 
@@ -584,6 +676,20 @@ impl<Q: BackendQ> StreamingTransformer<Q> {
         x: &Tensor<Q::T, Q::B>,
         state: &mut StreamingTransformerState<Q::T, Q::B>,
     ) -> Result<Tensor<Q::T, Q::B>> {
+        Ok(self.forward_span(x, state, None)?.0)
+    }
+
+    /// As [`Self::forward`], also returning the text-attention row when `span` names a layer.
+    #[allow(clippy::type_complexity)]
+    ///
+    /// `None` takes the ordinary path: the layer probe is never set, so no attention row is
+    /// computed. The row, when there is one, comes from the single layer `span.layer` names.
+    pub fn forward_span(
+        &self,
+        x: &Tensor<Q::T, Q::B>,
+        state: &mut StreamingTransformerState<Q::T, Q::B>,
+        span: Option<TextSpan>,
+    ) -> Result<(Tensor<Q::T, Q::B>, Option<Tensor<Q::T, Q::B>>)> {
         let mut x = x.clone();
         let (_, seq_len, _) = x.dims3()?;
         // At single-token decode every cached key is visible, so the causal mask is identically
@@ -635,10 +741,18 @@ impl<Q: BackendQ> StreamingTransformer<Q> {
             .unwrap_or(0);
         let rope =
             RotaryEmbedding::new(self.head_dim, offset, seq_len, self.max_period, x.device())?;
-        for (layer, layer_state) in self.layers.iter().zip(state.layer_states.iter_mut()) {
-            x = layer.forward(&x, &rope, layer_state, mask.as_ref())?;
+        let mut row = None;
+        for (index, (layer, layer_state)) in
+            self.layers.iter().zip(state.layer_states.iter_mut()).enumerate()
+        {
+            let probe = span.filter(|span| span.layer == index && span.len > 0);
+            let (y, layer_row) = layer.forward(&x, &rope, layer_state, mask.as_ref(), probe)?;
+            x = y;
+            if layer_row.is_some() {
+                row = layer_row;
+            }
         }
-        Ok(x)
+        Ok((x, row))
     }
 }
 
@@ -914,5 +1028,41 @@ mod bad_config_tests {
             let err = load(8, 4, kv_heads).err().unwrap_or_else(|| panic!("{kv_heads} kv heads"));
             assert!(err.to_string().contains("key/value heads"), "{err}");
         }
+    }
+}
+
+#[cfg(test)]
+mod text_row_tests {
+    use super::*;
+    use xn::CpuDevice;
+
+    type Q = xn::Unquantized<f32, CpuDevice>;
+
+    #[test]
+    fn the_row_peaks_on_the_text_token_the_query_matches() {
+        let dev = &CpuDevice;
+        // One head, dim 2. The query is [1, 0]. Keys: a voice position, two text positions,
+        // then a frame. Only the first text position matches the query.
+        let q = Tensor::<f32, CpuDevice>::from_vec(vec![1.0, 0.0], (1, 1, 1, 2), dev).unwrap();
+        let k = Tensor::<f32, CpuDevice>::from_vec(
+            vec![0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0],
+            (1, 4, 1, 2),
+            dev,
+        )
+        .unwrap();
+        let keys = k.narrow(1, 0..4).unwrap();
+        let span = TextSpan { start: 1, len: 2, layer: 0 };
+        let row = text_attention_row::<Q>(&q, &keys, span, 1.0 / 2.0_f32.sqrt()).unwrap();
+        let values = row.to_vec1().unwrap();
+        assert_eq!(values.len(), 2, "{values:?}");
+        assert!(values[0] > values[1], "the matching text token should win: {values:?}");
+        // Softmax was over all four keys, so the text slice does not use up the whole mass.
+        assert!(values[0] + values[1] < 0.99, "voice and frame keys keep some mass: {values:?}");
+    }
+
+    #[test]
+    fn the_middle_layer_of_six_is_the_third() {
+        assert_eq!(TextSpan::middle(4, 10, 6), TextSpan { start: 4, len: 10, layer: 3 });
+        assert_eq!(TextSpan::middle(0, 1, 1).layer, 0);
     }
 }
