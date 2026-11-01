@@ -34,6 +34,7 @@ use ptts::mimi::MimiDecoderState;
 use ptts::plan::{self, EosPolicy};
 use ptts::preprocess::{Normalize, Rules};
 use ptts::tok::Tok;
+use ptts::transformer::TextSpan;
 use ptts::transformer::{LayerAttentionState, StreamingMHAState, StreamingTransformerState};
 use ptts::tts_model::{MAX_TOKENS_PER_CHUNK, TTSConfig, TTSModel, TTSState};
 #[cfg(feature = "webgpu")]
@@ -135,6 +136,8 @@ struct ChunkState<Q: BackendQ<T = f32>> {
     done: bool,
     /// Frames recorded during the previous step's readback, returned by the next step.
     in_flight: Option<Pending<Q::B>>,
+    /// Text-token span for this chunk, set only when word timings were requested.
+    span: Option<TextSpan>,
 }
 
 struct GenState<Q: BackendQ<T = f32>> {
@@ -146,6 +149,12 @@ struct GenState<Q: BackendQ<T = f32>> {
     current: Option<ChunkState<Q>>,
     /// One noise source for the whole text, so a seed fixes every chunk.
     rng: NormalRng,
+    /// Word timings, present only when the request asked for them.
+    clock: Option<ptts::align::WordClock>,
+    /// The caller's text, so timings can be reported at JavaScript string indexes.
+    text: String,
+    /// Words fixed by the frames returned since the last `take_word_timings`.
+    words: Vec<ptts::align::WordTiming>,
 }
 
 /// Frames that have been generated and decoded on the device but not yet read back.
@@ -156,6 +165,9 @@ struct Pending<B: Backend> {
     /// Where the PCM ends and the logits start.
     pcm_len: usize,
     frames: usize,
+    /// Text tokens each frame's attention row covers. `0` when timings are off, in which
+    /// case the buffer is PCM followed by one logit per frame, as before.
+    text_len: usize,
 }
 
 /// Generates `frames` frames of `chunk` and decodes them as one batch, reading nothing back.
@@ -167,12 +179,23 @@ fn record_frames<Q: BackendQ<T = f32>>(
 ) -> Result<Pending<Q::B>> {
     let mut latents = Vec::with_capacity(frames);
     let mut eos_logits = Vec::with_capacity(frames);
+    let mut align_rows = Vec::new();
+    let span = chunk.span.filter(|span| span.len > 0);
     for _ in 0..frames {
         let input = match &chunk.prev_latent {
             None => StepInput::Bos { batch: 1 },
             Some(t) => StepInput::Latent(t),
         };
-        let (latent, eos_logit) = model.generate_step_parts(&mut chunk.tts_state, input, rng)?;
+        // Timings add the text-attention row to the same graph as the frame. It is read back
+        // below with the PCM, not on its own: a WebGPU step stays one round trip.
+        let (latent, eos_logit) = if let Some(span) = span {
+            let (latent, eos_logit, row) =
+                model.generate_step_aligned(&mut chunk.tts_state, input, rng, span)?;
+            align_rows.push(row);
+            (latent, eos_logit)
+        } else {
+            model.generate_step_parts(&mut chunk.tts_state, input, rng)?
+        };
         latent.device().synchronize()?;
         chunk.prev_latent = Some(latent.clone());
         latents.push(latent);
@@ -183,10 +206,19 @@ fn record_frames<Q: BackendQ<T = f32>>(
     let pcm = pcm.narrow(0, ..1)?.contiguous()?;
     let pcm_len = pcm.elem_count();
     let eos = Tensor::cat(&eos_logits.iter().collect::<Vec<_>>(), 0)?;
-    let out = Tensor::cat(&[&pcm.reshape(pcm_len)?, &eos.reshape(frames)?], 0)?;
+    let text_len = span.map(|span| span.len).unwrap_or(0);
+    let out = if text_len == 0 {
+        Tensor::cat(&[&pcm.reshape(pcm_len)?, &eos.reshape(frames)?], 0)?
+    } else {
+        let aligned = Tensor::cat(&align_rows.iter().collect::<Vec<_>>(), 0)?;
+        Tensor::cat(
+            &[&pcm.reshape(pcm_len)?, &eos.reshape(frames)?, &aligned.reshape(frames * text_len)?],
+            0,
+        )?
+    };
     out.device().synchronize()?;
     chunk.step += frames;
-    Ok(Pending { out, pcm_len, frames })
+    Ok(Pending { out, pcm_len, frames, text_len })
 }
 
 /// A loaded model on one device, and the generation in progress on it.
@@ -250,6 +282,7 @@ where
         Ok(state.flow_lm_state.transformer_state)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_generation(
         &mut self,
         voice_index: usize,
@@ -258,6 +291,7 @@ where
         seed: u64,
         normalize: Normalize,
         cfg: &TTSConfig,
+        timings: bool,
     ) -> Result<usize> {
         // Dropped before anything else can fail, so a caller that swallows the error cannot
         // go on stepping and quietly resume the *previous* utterance.
@@ -280,7 +314,23 @@ where
         let base = voice.with_seq_budget(seq_budget)?;
 
         let num_chunks = chunks.len();
-        self.gen_state = Some(GenState { base, chunks: chunks.into_iter(), current: None, rng });
+        let clock = if timings {
+            let Some(tokenizer) = self.model.flow_lm.conditioner.tokenizer.as_deref() else {
+                xn::bail!("word timings need the tokenizer this model was loaded with");
+            };
+            Some(ptts::align::map_utterance(text, &chunks, tokenizer)?.clock(cfg.mimi.frame_rate))
+        } else {
+            None
+        };
+        self.gen_state = Some(GenState {
+            base,
+            chunks: chunks.into_iter(),
+            current: None,
+            rng,
+            clock,
+            text: text.to_string(),
+            words: Vec::new(),
+        });
         Ok(num_chunks)
     }
 
@@ -306,11 +356,17 @@ where
             self.gen_state = None;
             return Ok(None);
         };
+        if let Some(clock) = gen_state.clock.as_mut() {
+            clock.begin_chunk();
+        }
         let transformer_state = gen_state.base.clone();
         let mut tts_state =
             TTSState { flow_lm_state: FlowLMState { transformer_state, conditions: None } };
         self.model.prompt_text(&mut tts_state, &chunk.tokens)?;
+        let span =
+            gen_state.clock.is_some().then(|| self.model.text_span(&tts_state, chunk.tokens.len()));
         let mimi_state = self.model.init_mimi_state(1)?;
+        let n_tokens = chunk.tokens.len();
         gen_state.current = Some(ChunkState {
             tts_state,
             mimi_state,
@@ -320,15 +376,18 @@ where
             step: 0,
             done: false,
             in_flight: None,
+            span,
         });
-        Ok(Some(chunk.tokens.len()))
+        Ok(Some(n_tokens))
     }
 
     /// Up to `frames_per_step` frames of the current chunk as PCM, or `None` once the chunk
     /// is finished.
     async fn step(&mut self) -> Result<Option<Vec<f32>>> {
         let Self { model, device, gen_state, frames_per_step, .. } = self;
-        let Some(GenState { current, rng, .. }) = gen_state.as_mut() else { return Ok(None) };
+        let Some(GenState { current, rng, clock, words, .. }) = gen_state.as_mut() else {
+            return Ok(None);
+        };
         let Some(chunk) = current.as_mut() else { return Ok(None) };
         let pending = match chunk.in_flight.take() {
             Some(pending) => pending,
@@ -353,7 +412,9 @@ where
             (device.read(&pending.out).await?, None)
         };
         chunk.in_flight = next;
-        let eos = pcm.split_off(pending.pcm_len);
+        let mut tail = pcm.split_off(pending.pcm_len);
+        let align = if pending.text_len > 0 { tail.split_off(pending.frames) } else { Vec::new() };
+        let eos = tail;
 
         // Keep frames up to the one where the end-of-speech rule runs out. `should_stop` is
         // asked after each frame, so that frame itself is part of the output, and the next
@@ -369,6 +430,19 @@ where
             }
         }
         pcm.truncate(keep * per_frame);
+        if let Some(clock) = clock.as_mut()
+            && pending.text_len > 0
+        {
+            for index in 0..keep {
+                let start = index * pending.text_len;
+                words.extend(clock.push(&align[start..start + pending.text_len]));
+            }
+            // The frames past `keep` were dropped, so the chunk's words close with the audio
+            // the caller actually receives.
+            if chunk.done || chunk.step >= chunk.frame_budget {
+                words.extend(clock.end_chunk());
+            }
+        }
         Ok(Some(pcm))
     }
 
@@ -392,6 +466,7 @@ where
             step: 0,
             done: false,
             in_flight: None,
+            span: None,
         };
         let mut rng = NormalRng::new(0.3, 0)?;
         let pending = record_frames(&self.model, &mut chunk, &mut rng, frames)?;
@@ -570,6 +645,28 @@ fn kv_cache_name(layer: usize) -> String {
     format!("transformer.layers.{layer}.self_attn/cache")
 }
 
+/// Character offsets are Unicode scalars. JavaScript indexes a string by UTF-16 code units.
+fn char_to_utf16(text: &str, chars: usize) -> u32 {
+    text.chars().take(chars).map(char::len_utf16).sum::<usize>() as u32
+}
+
+fn timings_to_js(text: &str, words: &[ptts::align::WordTiming]) -> JsValue {
+    let out = js_sys::Array::new();
+    for word in words {
+        let object = js_sys::Object::new();
+        let set = |key: &str, value: JsValue| {
+            let _ = js_sys::Reflect::set(&object, &JsValue::from_str(key), &value);
+        };
+        set("word", JsValue::from_str(&word.word));
+        set("start", JsValue::from(char_to_utf16(text, word.start)));
+        set("end", JsValue::from(char_to_utf16(text, word.end)));
+        set("from", JsValue::from_f64(word.from as f64));
+        set("to", JsValue::from_f64(word.to as f64));
+        out.push(&object);
+    }
+    out.into()
+}
+
 fn js_err(e: xn::Error) -> JsError {
     JsError::new(&e.to_string())
 }
@@ -675,12 +772,17 @@ impl Model {
 
     /// Normalizes `text`, splits it into sentence-aligned chunks and tokenizes them. Returns
     /// the number of chunks. Runs no model: call `next_chunk` to start the first one.
+    /// `timings` asks for word timings. The frames come back from `generation_step` exactly as
+    /// they do without it; [`Self::take_word_timings`] returns the words those frames fixed.
+    /// `false` computes nothing.
+    #[allow(clippy::too_many_arguments)]
     pub fn start_generation(
         &self,
         voice_index: usize,
         text: &str,
         temperature: f32,
         seed: u64,
+        timings: bool,
     ) -> std::result::Result<usize, JsError> {
         self.with(|l| {
             let (normalize, cfg) = (l.normalize, &l.cfg);
@@ -690,8 +792,26 @@ impl Model {
                 temperature,
                 seed,
                 normalize,
-                cfg
+                cfg,
+                timings,
             ))
+        })
+        .map_err(js_err)
+    }
+
+    /// Words fixed by the frames `generation_step` has returned since the previous call, in
+    /// order. Offsets are UTF-16 indexes into the text passed to `start_generation`, so
+    /// `text.slice(start, end)` is the word in JavaScript. Empty when timings were not
+    /// requested, and when the latest frames did not finish a word.
+    pub fn take_word_timings(&self) -> std::result::Result<JsValue, JsError> {
+        self.with(|l| {
+            with_engine!(&mut l.engine, |e| {
+                let Some(generation) = e.gen_state.as_mut() else {
+                    return Ok(js_sys::Array::new().into());
+                };
+                let words = std::mem::take(&mut generation.words);
+                Ok(timings_to_js(&generation.text, &words))
+            })
         })
         .map_err(js_err)
     }

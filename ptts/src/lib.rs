@@ -38,6 +38,7 @@
 //! | [`loader`] | Reading weights and voice files, and the checkpoint key mapping. |
 //! | [`error`] | [`Error`], what those two return. |
 //! | [`plan`] | Frame and KV budgets, the end-of-speech policy. |
+//! | [`align`] | Optional word timings, from the flow LM's text attention. |
 //! | [`preprocess`] | Per-language text normalization, applied before tokenizing. |
 //! | [`tok`] | The Hugging Face tokenizer, behind the `hf` feature. |
 //! | [`audio`] | Decoding and resampling audio files for voice cloning, behind `audio`. |
@@ -75,6 +76,7 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+pub mod align;
 #[cfg(feature = "audio")]
 pub mod audio;
 #[cfg(not(target_arch = "wasm32"))]
@@ -119,6 +121,15 @@ pub use error::{Error, Result};
 pub trait Tokenizer {
     fn encode(&self, text: &str) -> xn::Result<Vec<u32>>;
     fn decode(&self, tokens: &[u32]) -> xn::Result<String>;
+
+    /// Encode `text`, and where each token sits in it.
+    ///
+    /// Offsets are byte offsets into `text`. The default reports every token at `(0, 0)`,
+    /// which [`align`] treats as unknown and spaces the tokens across the words instead.
+    /// A tokenizer that knows its alignment, [`tok::Tok`], reports the real spans.
+    fn encode_spans(&self, text: &str) -> xn::Result<Vec<(u32, usize, usize)>> {
+        Ok(self.encode(text)?.into_iter().map(|id| (id, 0, 0)).collect())
+    }
 }
 
 #[cfg(test)]

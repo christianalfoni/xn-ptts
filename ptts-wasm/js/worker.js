@@ -260,10 +260,10 @@ async function registerVoice(bytes) {
   return index;
 }
 
-async function handleGenerate(id, { text, voice, temperature, seed }) {
+async function handleGenerate(id, { text, voice, temperature, seed, timings }) {
   const index = await voiceIndex(voice);
   const t0 = performance.now();
-  const chunks = model.start_generation(index, text, temperature, seed);
+  const chunks = model.start_generation(index, text, temperature, seed, Boolean(timings));
 
   const stats = { chunks, tokens: 0, frames: 0, samples: 0, promptMs: 0, stepMs: { avg: 0, min: 0, max: 0 }, firstAudioMs: null, totalMs: 0, cancelled: false };
   let stepMsTotal = 0;
@@ -299,7 +299,10 @@ async function handleGenerate(id, { text, voice, temperature, seed }) {
         stats.frames += frames;
         stats.samples += pcm.length;
         stats.firstAudioMs ??= performance.now() - t0;
-        post({ type: 'chunk', id, pcm }, [pcm.buffer]);
+        // The attention rows rode back in the same buffer as the PCM. Empty when timings
+        // are off, and when this step did not finish a word.
+        const words = timings ? model.take_word_timings() : undefined;
+        post({ type: 'chunk', id, pcm, words: words?.length ? words : undefined }, [pcm.buffer]);
         await yieldToEventLoop();
       }
     }

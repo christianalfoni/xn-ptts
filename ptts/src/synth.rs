@@ -57,6 +57,7 @@
 //! Driving the loop by hand, from an event loop with no threads to spawn, as
 //! `ptts-wasm` does, is what [`crate::tts_model::TTSModel`]'s primitives are for.
 
+pub use crate::align::WordTiming;
 use crate::comp::{AudioModule, Chain, ModuleConfig};
 use crate::conditioners::Conditioners;
 use crate::flow_lm::{NormalRng, StepInput};
@@ -236,6 +237,8 @@ pub struct SpeechOptions {
     pub max_tokens_per_chunk: Option<usize>,
     /// Audio modules run over the PCM, in order, before it is handed out.
     pub post_process: Option<Vec<ModuleConfig>>,
+    /// Report [`WordTiming`]s for the text. Nothing is computed when this is false.
+    pub timings: bool,
 }
 
 impl SpeechOptions {
@@ -268,6 +271,15 @@ impl SpeechOptions {
         self.post_process = Some(modules.into_iter().collect());
         self
     }
+
+    /// Report when each word of the text is spoken. See [`SpeechStream::word_timings`].
+    ///
+    /// Off unless asked: the flow LM then does not read its text attention, and a request
+    /// costs what it costs today.
+    pub fn timings(mut self, timings: bool) -> Self {
+        self.timings = timings;
+        self
+    }
 }
 
 /// Defaults applied to every request unless overridden per call.
@@ -279,6 +291,7 @@ struct Defaults {
     cfg_coef: Option<f32>,
     max_tokens_per_chunk: usize,
     post_process: Vec<ModuleConfig>,
+    timings: bool,
 }
 
 /// Merge per-request overrides onto the settings a [`SynthBuilder`] was given.
@@ -310,6 +323,7 @@ fn resolve(defaults: &Defaults, opts: &SpeechOptions) -> Result<Defaults> {
         },
         max_tokens_per_chunk: opts.max_tokens_per_chunk.unwrap_or(defaults.max_tokens_per_chunk),
         post_process: opts.post_process.clone().unwrap_or_else(|| defaults.post_process.clone()),
+        timings: opts.timings,
     })
 }
 
@@ -376,6 +390,7 @@ impl<Q: BackendQ> SynthOf<Q> {
             seq_budget,
             normalize: self.normalize,
             post_process: settings.post_process.clone(),
+            timings: settings.timings,
             inline_decode: self.inline_decode,
         })
     }
@@ -767,9 +782,9 @@ impl<Q: BackendQ> SynthApi for SynthOf<Q> {
             Some((_, voice)) => voice.emb.dim(1usize)?,
             None => 0,
         };
-        let text = chunks.iter().map(|c| c.tokens.len() + c.frame_budget).max().unwrap_or(0);
-        let seq_budget = text + prompt.max(plan::PROMPT_SEQ_HEADROOM);
-        self.session_at(&settings, seq_budget)?.stream_chunks(chunks, rng)
+        let longest = chunks.iter().map(|c| c.tokens.len() + c.frame_budget).max().unwrap_or(0);
+        let seq_budget = longest + prompt.max(plan::PROMPT_SEQ_HEADROOM);
+        self.session_at(&settings, seq_budget)?.stream_chunks(text, chunks, rng, settings.timings)
     }
 
     fn quant(&self) -> Quant {
@@ -833,6 +848,8 @@ struct SessionOf<Q: BackendQ> {
     prompt_len: usize,
     /// Audio modules run over every generation's PCM, fresh for each one.
     post_process: Vec<ModuleConfig>,
+    /// Whether generations from this session report word timings.
+    timings: bool,
     /// Set while a generation is running. See the note on this type.
     in_flight: Arc<std::sync::atomic::AtomicBool>,
     /// See [`SynthOf::inline_decode`].
@@ -861,7 +878,7 @@ impl<Q: BackendQ> SessionOf<Q> {
             self.normalize,
             fit_to,
         )?;
-        self.stream_chunks(chunks, rng)
+        self.stream_chunks(text, chunks, rng, self.timings)
     }
 
     /// Start the two worker threads for an already-planned set of chunks.
@@ -870,8 +887,10 @@ impl<Q: BackendQ> SessionOf<Q> {
     /// reaches it through an ephemeral session.
     fn stream_chunks(
         &self,
+        text: &str,
         chunks: Vec<Chunk>,
         rng: Box<dyn crate::flow_lm::Rng + Send>,
+        time_words: bool,
     ) -> Result<SpeechStream> {
         // `Chunk::seq_budget` reserves PROMPT_SEQ_HEADROOM for a voice prompt whose
         // real length this session knows, so it over-states what is needed for
@@ -910,7 +929,17 @@ impl<Q: BackendQ> SessionOf<Q> {
         let mimi_init = self.model.init_mimi_state(1)?;
         let mut post = Chain::from_modules(self.sample_rate(), &self.post_process);
 
-        let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel::<Result<Vec<f32>>>(PCM_QUEUE);
+        let clock = if time_words {
+            let Some(tokenizer) = self.model.flow_lm.conditioner.tokenizer.as_deref() else {
+                return Err(Error::unsupported(
+                    "word timings need the tokenizer this model was loaded with",
+                ));
+            };
+            Some(crate::align::map_utterance(text, &chunks, tokenizer)?.clock(self.frame_rate))
+        } else {
+            None
+        };
+        let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel::<Result<AudioMsg>>(PCM_QUEUE);
 
         let workers = if self.inline_decode {
             // One shared command queue (CUDA, Metal): a second thread has no second execution
@@ -919,8 +948,9 @@ impl<Q: BackendQ> SessionOf<Q> {
             let model = Arc::clone(&self.model);
             let handle = std::thread::spawn(move || {
                 let _in_flight = in_flight;
-                let result =
-                    run_inline(&model, chunks, base_state, cfg_base, rng, mimi_init, &pcm_tx, post);
+                let result = run_inline(
+                    &model, chunks, base_state, cfg_base, rng, mimi_init, &pcm_tx, post, clock,
+                );
                 if let Err(e) = result {
                     let _ = pcm_tx.send(Err(e));
                 }
@@ -993,7 +1023,7 @@ impl<Q: BackendQ> SessionOf<Q> {
                         })
                         .map_err(Error::from);
                     let failed = pcm.is_err();
-                    if decode_tx.send(pcm).is_err() || failed {
+                    if decode_tx.send(pcm.map(AudioMsg::Pcm)).is_err() || failed {
                         return;
                     }
                     if let Some(first_tx) = first_tx.take() {
@@ -1008,7 +1038,7 @@ impl<Q: BackendQ> SessionOf<Q> {
                     let mut tail = vec![0.0; latency];
                     post.process(&mut tail);
                     tail.drain(..skip);
-                    let _ = decode_tx.send(Ok(tail));
+                    let _ = decode_tx.send(Ok(AudioMsg::Pcm(tail)));
                 }
             });
 
@@ -1017,8 +1047,9 @@ impl<Q: BackendQ> SessionOf<Q> {
             let backbone_handle = std::thread::spawn(move || {
                 // Dropped when this thread ends, which is after its last write.
                 let _in_flight = in_flight;
-                let result =
-                    run_backbone(&model, chunks, base_state, cfg_base, rng, &latent_tx, first_rx);
+                let result = run_backbone(
+                    &model, chunks, base_state, cfg_base, rng, &latent_tx, first_rx, clock, &pcm_tx,
+                );
                 if let Err(e) = result {
                     let _ = pcm_tx.send(Err(e));
                 }
@@ -1031,6 +1062,7 @@ impl<Q: BackendQ> SessionOf<Q> {
             rx: Some(pcm_rx),
             sample_rate: self.sample_rate(),
             failed: false,
+            words: Vec::new(),
             workers: Some(workers),
         })
     }
@@ -1090,7 +1122,8 @@ impl<Q: BackendQ> SessionApi for SessionOf<Q> {
         }
         let frame_budget = plan::frame_budget(tokens.len(), self.frame_rate);
         let chunk = Chunk { text: String::new(), tokens, frames_after_eos, frame_budget };
-        self.stream_chunks(vec![chunk], rng)
+        // Tokens arrived already cut, with no source text to point a timing at.
+        self.stream_chunks("", vec![chunk], rng, false)
     }
 }
 
@@ -1129,6 +1162,20 @@ const PCM_QUEUE: usize = 4;
 const LATENT_QUEUE: usize = 16;
 const DECODE_BATCH: usize = LATENT_QUEUE;
 
+/// What a generation sends its caller: audio, or words whose time was just fixed.
+enum AudioMsg {
+    Pcm(Vec<f32>),
+    Words(Vec<WordTiming>),
+}
+
+fn send_words(tx: &std::sync::mpsc::SyncSender<Result<AudioMsg>>, words: Vec<WordTiming>) -> bool {
+    words.is_empty() || tx.send(Ok(AudioMsg::Words(words))).is_ok()
+}
+
+fn row_f32<T: xn::WithDTypeF, B: xn::Backend>(row: &Tensor<T, B>) -> xn::Result<Vec<f32>> {
+    Ok(row.to_vec()?.into_iter().map(|value| value.to_f32()).collect())
+}
+
 /// Messages from the flow-LM thread to the decoder thread.
 enum Frame<Q: BackendQ> {
     Latent(Tensor<Q::T, Q::B>),
@@ -1136,6 +1183,7 @@ enum Frame<Q: BackendQ> {
 }
 
 /// The autoregressive loop, shared by every frontend and every chunk.
+#[allow(clippy::too_many_arguments)]
 fn run_backbone<Q: BackendQ>(
     model: &TTSModel<Q>,
     chunks: Vec<Chunk>,
@@ -1144,6 +1192,8 @@ fn run_backbone<Q: BackendQ>(
     mut rng: Box<dyn crate::flow_lm::Rng + Send>,
     latent_tx: &std::sync::mpsc::SyncSender<Frame<Q>>,
     first_decoded: std::sync::mpsc::Receiver<()>,
+    mut clock: Option<crate::align::WordClock>,
+    words_tx: &std::sync::mpsc::SyncSender<Result<AudioMsg>>,
 ) -> Result<()> {
     // Taken after the first frame: only the stream's first audio is worth the wait.
     let mut first_decoded = Some(first_decoded);
@@ -1154,6 +1204,11 @@ fn run_backbone<Q: BackendQ>(
         if let Some((_, null_state)) = cfg_state.as_mut() {
             model.prompt_text_null(null_state)?;
         }
+        if let Some(clock) = clock.as_mut() {
+            clock.begin_chunk();
+        }
+        // Taken after the prompt, once: later frames append audio past the text.
+        let span = clock.is_some().then(|| model.text_span(&state, chunk.tokens.len()));
 
         let mut prev: Option<Tensor<Q::T, Q::B>> = None;
         let mut eos = EosPolicy::new(chunk.frames_after_eos);
@@ -1163,12 +1218,40 @@ fn run_backbone<Q: BackendQ>(
                 None => StepInput::Bos { batch: 1 },
                 Some(t) => StepInput::Latent(t),
             };
-            let (next, is_eos) = match cfg_state.as_mut() {
-                Some((coef, null_state)) => {
-                    model.generate_step_cfg(&mut state, null_state, *coef, input, &mut rng)?
+            let (next, is_eos, row) = if let Some(span) = span {
+                match cfg_state.as_mut() {
+                    Some((coef, null_state)) => {
+                        let (next, is_eos, row) = model.generate_step_cfg_aligned(
+                            &mut state, null_state, *coef, input, &mut rng, span,
+                        )?;
+                        (next, is_eos, Some(row))
+                    }
+                    None => {
+                        let (next, logit, row) =
+                            model.generate_step_aligned(&mut state, input, &mut rng, span)?;
+                        let is_eos = model.eos_from_logit(&logit.to_vec()?);
+                        (next, is_eos, Some(row))
+                    }
                 }
-                None => model.generate_step(&mut state, input, &mut rng)?,
+            } else {
+                match cfg_state.as_mut() {
+                    Some((coef, null_state)) => {
+                        let (next, is_eos) = model
+                            .generate_step_cfg(&mut state, null_state, *coef, input, &mut rng)?;
+                        (next, is_eos, None)
+                    }
+                    None => {
+                        let (next, is_eos) = model.generate_step(&mut state, input, &mut rng)?;
+                        (next, is_eos, None)
+                    }
+                }
             };
+            if let (Some(clock), Some(row)) = (clock.as_mut(), row.as_ref()) {
+                let words = clock.push(&row_f32(row)?);
+                if !send_words(words_tx, words) {
+                    return Ok(());
+                }
+            }
             // A closed channel means the consumer went away; stop quietly and
             // let the decoder thread report any error of its own.
             if latent_tx.send(Frame::Latent(next.clone())).is_err() {
@@ -1184,6 +1267,11 @@ fn run_backbone<Q: BackendQ>(
                 break;
             }
             prev = Some(next);
+        }
+        if let Some(clock) = clock.as_mut()
+            && !send_words(words_tx, clock.end_chunk())
+        {
+            return Ok(());
         }
         if latent_tx.send(Frame::ChunkEnd).is_err() {
             return Ok(());
@@ -1204,8 +1292,9 @@ fn run_inline<Q: BackendQ>(
     cfg_base: Option<(f32, TTSState<Q>)>,
     mut rng: Box<dyn crate::flow_lm::Rng + Send>,
     mimi_init: crate::mimi::MimiDecoderState<f32, Q::B>,
-    pcm_tx: &std::sync::mpsc::SyncSender<Result<Vec<f32>>>,
+    pcm_tx: &std::sync::mpsc::SyncSender<Result<AudioMsg>>,
     mut post: Chain,
+    mut clock: Option<crate::align::WordClock>,
 ) -> Result<()> {
     let mut mimi_state = mimi_init.clone();
     // The post-processing chain delays its output: its first `skip` samples are the zeros it
@@ -1218,6 +1307,10 @@ fn run_inline<Q: BackendQ>(
         if let Some((_, null_state)) = cfg_state.as_mut() {
             model.prompt_text_null(null_state)?;
         }
+        if let Some(clock) = clock.as_mut() {
+            clock.begin_chunk();
+        }
+        let span = clock.is_some().then(|| model.text_span(&state, chunk.tokens.len()));
 
         let mut prev: Option<Tensor<Q::T, Q::B>> = None;
         let mut eos = EosPolicy::new(chunk.frames_after_eos);
@@ -1228,16 +1321,34 @@ fn run_inline<Q: BackendQ>(
                 Some(t) => StepInput::Latent(t),
             };
             // Without guidance the eos logit is read back with the frame's audio, so the frame
-            // waits on the device once instead of twice.
-            let (next, is_eos, eos_logit) = match cfg_state.as_mut() {
-                Some((coef, null_state)) => {
-                    let (next, is_eos) =
-                        model.generate_step_cfg(&mut state, null_state, *coef, input, &mut rng)?;
-                    (next, is_eos, None)
+            // waits on the device once instead of twice. The attention row, when there is one,
+            // is read then too: it was recorded in the same step.
+            let (next, is_eos, eos_logit, row) = if let Some(span) = span {
+                match cfg_state.as_mut() {
+                    Some((coef, null_state)) => {
+                        let (next, is_eos, row) = model.generate_step_cfg_aligned(
+                            &mut state, null_state, *coef, input, &mut rng, span,
+                        )?;
+                        (next, is_eos, None, Some(row))
+                    }
+                    None => {
+                        let (next, logit, row) =
+                            model.generate_step_aligned(&mut state, input, &mut rng, span)?;
+                        (next, false, Some(logit), Some(row))
+                    }
                 }
-                None => {
-                    let (next, logit) = model.generate_step_parts(&mut state, input, &mut rng)?;
-                    (next, false, Some(logit))
+            } else {
+                match cfg_state.as_mut() {
+                    Some((coef, null_state)) => {
+                        let (next, is_eos) = model
+                            .generate_step_cfg(&mut state, null_state, *coef, input, &mut rng)?;
+                        (next, is_eos, None, None)
+                    }
+                    None => {
+                        let (next, logit) =
+                            model.generate_step_parts(&mut state, input, &mut rng)?;
+                        (next, false, Some(logit), None)
+                    }
                 }
             };
             let pcm = model
@@ -1254,8 +1365,14 @@ fn run_inline<Q: BackendQ>(
             let failed = pcm.is_err();
             // A closed channel means the consumer went away; stop quietly and let the caller
             // report any error of its own.
-            if pcm_tx.send(pcm).is_err() || failed {
+            if pcm_tx.send(pcm.map(AudioMsg::Pcm)).is_err() || failed {
                 return Ok(());
+            }
+            if let (Some(clock), Some(row)) = (clock.as_mut(), row.as_ref()) {
+                let words = clock.push(&row_f32(row)?);
+                if !send_words(pcm_tx, words) {
+                    return Ok(());
+                }
             }
             let is_eos = match eos_logit {
                 Some(logit) => model.eos_from_logit(&logit.to_vec()?),
@@ -1266,6 +1383,11 @@ fn run_inline<Q: BackendQ>(
             }
             prev = Some(next);
         }
+        if let Some(clock) = clock.as_mut()
+            && !send_words(pcm_tx, clock.end_chunk())
+        {
+            return Ok(());
+        }
         mimi_state = mimi_init.clone();
     }
     let latency = post.latency();
@@ -1273,7 +1395,7 @@ fn run_inline<Q: BackendQ>(
         let mut tail = vec![0.0; latency];
         post.process(&mut tail);
         tail.drain(..skip);
-        let _ = pcm_tx.send(Ok(tail));
+        let _ = pcm_tx.send(Ok(AudioMsg::Pcm(tail)));
     }
     Ok(())
 }
@@ -1293,9 +1415,12 @@ pub struct SpeechStream {
     /// `Option` so [`Drop`] can release it before joining: closing this receiver
     /// wakes a decoder blocked on output, which closes the latent receiver
     /// and wakes the backbone in turn.
-    rx: Option<std::sync::mpsc::Receiver<Result<Vec<f32>>>>,
+    rx: Option<std::sync::mpsc::Receiver<Result<AudioMsg>>>,
     sample_rate: u32,
     failed: bool,
+    /// Words reported so far. Filled as the iterator receives them, which is as the frames
+    /// that fixed their end time arrive. Empty when timings were not requested.
+    words: Vec<WordTiming>,
     /// The generation thread(s), joined once the channel closes so that a panic in any of them
     /// surfaces as an error rather than as truncated audio. Two threads (flow LM and Mimi
     /// decoder) on the CPU, one thread doing both inline on devices with a single shared
@@ -1306,6 +1431,15 @@ pub struct SpeechStream {
 impl SpeechStream {
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    /// Words of the request whose time is known so far, in order.
+    ///
+    /// Empty until a frame arrives, and until the iterator has been pulled that far. After
+    /// the iterator ends, this is every word. Empty for the whole stream when timings were
+    /// not requested: nothing was computed.
+    pub fn word_timings(&self) -> &[WordTiming] {
+        &self.words
     }
 
     fn join_workers(&mut self) -> bool {
@@ -1346,7 +1480,11 @@ impl Iterator for SpeechStream {
                 self.join_workers();
                 Some(Err(e))
             }
-            Ok(ok) => Some(ok),
+            Ok(Ok(AudioMsg::Words(words))) => {
+                self.words.extend(words);
+                self.next()
+            }
+            Ok(Ok(AudioMsg::Pcm(pcm))) => Some(Ok(pcm)),
             // Every sender dropped: generation finished, or a worker died.
             Err(_) => {
                 self.failed = true;
@@ -1690,6 +1828,7 @@ impl SynthBuilder {
                 cfg_coef: self.cfg_coef,
                 max_tokens_per_chunk: self.max_tokens_per_chunk,
                 post_process: self.post_process.clone(),
+                timings: false,
             },
             normalize: self.normalize,
             conditioners,
@@ -2079,6 +2218,7 @@ mod tests {
             cfg_coef: None,
             max_tokens_per_chunk: 50,
             post_process: vec![],
+            timings: false,
         }
     }
 
@@ -2181,7 +2321,7 @@ mod tests {
         });
         let decoder = std::thread::spawn(move || {
             while latent_rx.recv().is_ok() {
-                if pcm_tx.send(Ok(vec![0.1])).is_err() {
+                if pcm_tx.send(Ok(AudioMsg::Pcm(vec![0.1]))).is_err() {
                     return;
                 }
             }
@@ -2191,6 +2331,7 @@ mod tests {
             rx: Some(pcm_rx),
             sample_rate: 24000,
             failed: false,
+            words: Vec::new(),
             workers: Some(vec![backbone, decoder]),
         };
         let (done_tx, done_rx) = mpsc::sync_channel(1);
@@ -2210,7 +2351,7 @@ mod tests {
         let worker_stopped = stopped.clone();
         let worker = std::thread::spawn(move || {
             tx.send(Err(Error::invalid_argument("failed"))).unwrap();
-            while tx.send(Ok(vec![0.1])).is_ok() {}
+            while tx.send(Ok(AudioMsg::Pcm(vec![0.1]))).is_ok() {}
             worker_stopped.store(true, Ordering::Release);
         });
         let other = std::thread::spawn(|| {});
@@ -2218,6 +2359,7 @@ mod tests {
             rx: Some(rx),
             sample_rate: 24000,
             failed: false,
+            words: Vec::new(),
             workers: Some(vec![worker, other]),
         };
         assert!(stream.next().unwrap().is_err());

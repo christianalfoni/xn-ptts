@@ -52,6 +52,21 @@ Cancellation discards unread stream chunks. Stop any audio already scheduled in 
 
 `speech.done` resolves with timing stats (frames, time to first audio, per-frame time) once generation ends. `stats.cancelled` reports whether the worker stopped before generation finished; it can be false if cancellation arrived after the worker finished.
 
+Pass `timings: true` to learn when each word is spoken. The audio iterator is unchanged. Words arrive on `speech.words` as their end time becomes known, and `stats.words` lists all of them once `done` resolves. `start` and `end` are indexes into the text you passed, so `text.slice(start, end)` is the word, and `from` and `to` are seconds from the start of this request's audio. Left off, nothing about the model's attention is computed.
+
+```js
+const speech = tts.stream(text, { timings: true });
+const playing = (async () => {
+  for await (const pcm of speech) {
+    // schedule pcm as above; word.from is a time on the same clock
+  }
+})();
+for await (const word of speech.words) {
+  // highlight text.slice(word.start, word.end) from word.from to word.to
+}
+await playing;
+```
+
 **Migration note:** `cancel()` now discards unread chunks even when generation has already finished. To keep all generated audio, drain the stream without cancelling it.
 
 ## API
@@ -74,7 +89,7 @@ Cancellation discards unread stream chunks. Stop any audio already scheduled in 
 
 ### Instance
 
-- `tts.stream(text, { voice, temperature, seed, signal })` returns a `SpeechStream`: an async iterable of `Float32Array`, plus `done` and `cancel()`.
+- `tts.stream(text, { voice, temperature, seed, signal, timings })` returns a `SpeechStream`: an async iterable of `Float32Array`, plus `words` (when `timings` is set), `done` and `cancel()`.
 - `tts.synth(text, options)` returns the whole waveform as a `Float32Array`.
 - `tts.synthWav(text, options)` returns a WAV `Blob`.
 - `tts.voices`: the names you can pass as `voice`: the keys of `model.voices`, plus any added with `addVoice`.

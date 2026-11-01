@@ -110,6 +110,27 @@ export interface SpeechOptions {
   seed?: number | bigint;
   /** Aborting stops generation and discards unread chunks. Stop scheduled playback separately. */
   signal?: AbortSignal;
+  /**
+   * Report when each word is spoken. The audio iterator still yields `Float32Array`s.
+   * Words arrive on {@link SpeechStream.words} as their end time is known, and on
+   * {@link SpeechStream.done} as `stats.words`. Default false, which computes nothing.
+   */
+  timings?: boolean;
+}
+
+/** One word of the text passed to `stream`, and when it is spoken. */
+export interface WordTiming {
+  /** The word as it appears in that text. */
+  word: string;
+  /**
+   * UTF-16 offsets into that text, so `text.slice(start, end)` is `word`. They address the
+   * text before normalization.
+   */
+  start: number;
+  end: number;
+  /** Seconds from the start of this request's audio. */
+  from: number;
+  to: number;
 }
 
 export interface SpeechStats {
@@ -135,6 +156,8 @@ export interface SpeechStats {
   totalMs?: number;
   /** The generation was stopped before it finished. */
   cancelled: boolean;
+  /** Present when timings were requested: every word, in order, once generation has ended. */
+  words?: WordTiming[];
 }
 
 /** Audio as it is generated. Iterate it once. */
@@ -142,6 +165,11 @@ export interface SpeechStream extends AsyncIterable<Float32Array> {
   readonly sampleRate: number;
   /** Resolves with timing stats once generation ends, or rejects if it failed. */
   readonly done: Promise<SpeechStats>;
+  /**
+   * Words as their end time becomes known, in order. Empty when timings were not requested.
+   * Iterating it does not stop the audio.
+   */
+  readonly words: AsyncIterable<WordTiming>;
   /** Stop generating and discard unread chunks. Await `done` for cleanup. Breaking out of a `for await` loop does the same. */
   cancel(): void;
 }

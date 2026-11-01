@@ -282,28 +282,41 @@ impl<Q: BackendQ> FlowLM<Q> {
     }
 
     /// Run the backbone: concat text_embeddings + input, run transformer, strip prefix.
+    ///
+    /// `span`, when set on a single-frame step, also returns that frame's text attention.
+    /// `None` calls the transformer's ordinary forward, which does not compute it.
+    #[allow(clippy::type_complexity)]
     fn backbone(
         &self,
         input: &Tensor<Q::T, Q::B>,
         text_embeddings: &Tensor<Q::T, Q::B>,
         seq_len: usize,
         state: &mut FlowLMState<Q>,
-    ) -> Result<Tensor<Q::T, Q::B>> {
+        span: Option<crate::transformer::TextSpan>,
+    ) -> Result<(Tensor<Q::T, Q::B>, Option<Tensor<Q::T, Q::B>>)> {
         let input = match state.conditions.as_ref().or(self.condition_providers.as_ref()) {
             Some(ns) => input.broadcast_add(ns)?,
             None => input.clone(),
         };
         let input = Tensor::cat(&[text_embeddings, &input], 1)?;
-        let out = self.transformer.forward(&input, &mut state.transformer_state)?;
+        // Only a one-frame step has a single new query to read. A text prompt is longer, and
+        // its attention is not an alignment.
+        let (out, row) = match span.filter(|_| seq_len == 1) {
+            Some(span) => {
+                self.transformer.forward_span(&input, &mut state.transformer_state, Some(span))?
+            }
+            None => (self.transformer.forward(&input, &mut state.transformer_state)?, None),
+        };
         let out = out.layer_norm(&self.out_norm_weight, &self.out_norm_bias, 1e-5)?;
         // Remove prefix, keep only last seq_len positions
         let total = out.dim(1usize)?;
         let start = total - seq_len;
         let out = out.narrow(1, start..total)?.contiguous()?;
-        match &self.z_proj {
-            Some(z_proj) => z_proj.forward(&out),
-            None => Ok(out),
-        }
+        let out = match &self.z_proj {
+            Some(z_proj) => z_proj.forward(&out)?,
+            None => out,
+        };
+        Ok((out, row))
     }
 
     fn step_embedding(&self, input: StepInput<'_, Q>) -> Result<Tensor<Q::T, Q::B>> {
@@ -352,15 +365,56 @@ impl<Q: BackendQ> FlowLM<Q> {
         lsd_decode_steps: usize,
         rng: &mut impl Rng,
     ) -> Result<(Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>)> {
+        let (latent, eos, _) =
+            self.sample_parts(input, text_embeddings, state, lsd_decode_steps, rng, None)?;
+        Ok((latent, eos))
+    }
+
+    /// As [`Self::sample_next_latent_parts`], also returning the frame's text-attention row.
+    ///
+    /// The row is `span.len` long and stays on the device, so a caller can read it back
+    /// together with the audio. The ordinary step does not call this.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn sample_next_latent_aligned(
+        &self,
+        input: StepInput<'_, Q>,
+        text_embeddings: &Tensor<Q::T, Q::B>,
+        state: &mut FlowLMState<Q>,
+        lsd_decode_steps: usize,
+        rng: &mut impl Rng,
+        span: crate::transformer::TextSpan,
+    ) -> Result<(Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>)> {
+        let (latent, eos, row) =
+            self.sample_parts(input, text_embeddings, state, lsd_decode_steps, rng, Some(span))?;
+        let row = row.ok_or_else(|| {
+            xn::Error::msg(format!(
+                "layer {} produced no text attention; this model has no such flow-LM layer",
+                span.layer
+            ))
+        })?;
+        Ok((latent, eos, row))
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn sample_parts(
+        &self,
+        input: StepInput<'_, Q>,
+        text_embeddings: &Tensor<Q::T, Q::B>,
+        state: &mut FlowLMState<Q>,
+        lsd_decode_steps: usize,
+        rng: &mut impl Rng,
+        span: Option<crate::transformer::TextSpan>,
+    ) -> Result<(Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>, Option<Tensor<Q::T, Q::B>>)> {
         let sequence = self.step_embedding(input)?;
         let (b, s, _) = sequence.dims3()?;
 
         let input = self.input_linear.forward(&sequence)?;
-        let t_out = self.backbone(&input, text_embeddings, s, state)?;
+        let (t_out, row) = self.backbone(&input, text_embeddings, s, state, span)?;
         let t_len = t_out.dim(1usize)?;
         let t_out = t_out.narrow(1, t_len - 1..t_len)?.contiguous()?.reshape((b, self.dim))?;
 
-        self.sample_from(&t_out, b, lsd_decode_steps, rng)
+        let (latent, eos) = self.sample_from(&t_out, b, lsd_decode_steps, rng)?;
+        Ok((latent, eos, row))
     }
 
     /// Threshold an eos logit already on the host. Only row 0 decides; an empty
@@ -387,16 +441,53 @@ impl<Q: BackendQ> FlowLM<Q> {
         let (b, s, _) = sequence.dims3()?;
 
         let x = self.input_linear.forward(&sequence)?;
-        let t_out = self.backbone(&x, text_embeddings, s, state)?;
+        let (t_out, _) = self.backbone(&x, text_embeddings, s, state, None)?;
         let t_len = t_out.dim(1usize)?;
         let t_out = t_out.narrow(1, t_len - 1..t_len)?.contiguous()?.reshape((b, self.dim))?;
-        let null_out = self.backbone(&x, text_embeddings, s, null_state)?;
+        let (null_out, _) = self.backbone(&x, text_embeddings, s, null_state, None)?;
         let null_out =
             null_out.narrow(1, t_len - 1..t_len)?.contiguous()?.reshape((b, self.dim))?;
         let t_out = t_out.sub(&null_out)?.scale(Q::T::from_f32(cfg_coef))?.add(&null_out)?;
 
         let (latent, eos_logit) = self.sample_from(&t_out, b, lsd_decode_steps, rng)?;
         Ok((latent, Self::eos_from_logit(&eos_logit.to_vec()?, eos_threshold)))
+    }
+
+    /// As [`Self::sample_next_latent_cfg`], also returning the conditional branch's text
+    /// attention. The null branch is not read: it was not conditioned on the text.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn sample_next_latent_cfg_aligned(
+        &self,
+        input: StepInput<'_, Q>,
+        text_embeddings: &Tensor<Q::T, Q::B>,
+        state: &mut FlowLMState<Q>,
+        null_state: &mut FlowLMState<Q>,
+        cfg_coef: f32,
+        lsd_decode_steps: usize,
+        rng: &mut impl Rng,
+        eos_threshold: f32,
+        span: crate::transformer::TextSpan,
+    ) -> Result<(Tensor<Q::T, Q::B>, bool, Tensor<Q::T, Q::B>)> {
+        let sequence = self.step_embedding(input)?;
+        let (b, s, _) = sequence.dims3()?;
+
+        let x = self.input_linear.forward(&sequence)?;
+        let (t_out, row) = self.backbone(&x, text_embeddings, s, state, Some(span))?;
+        let t_len = t_out.dim(1usize)?;
+        let t_out = t_out.narrow(1, t_len - 1..t_len)?.contiguous()?.reshape((b, self.dim))?;
+        let (null_out, _) = self.backbone(&x, text_embeddings, s, null_state, None)?;
+        let null_out =
+            null_out.narrow(1, t_len - 1..t_len)?.contiguous()?.reshape((b, self.dim))?;
+        let t_out = t_out.sub(&null_out)?.scale(Q::T::from_f32(cfg_coef))?.add(&null_out)?;
+
+        let (latent, eos_logit) = self.sample_from(&t_out, b, lsd_decode_steps, rng)?;
+        let row = row.ok_or_else(|| {
+            xn::Error::msg(format!(
+                "layer {} produced no text attention; this model has no such flow-LM layer",
+                span.layer
+            ))
+        })?;
+        Ok((latent, Self::eos_from_logit(&eos_logit.to_vec()?, eos_threshold), row))
     }
 }
 

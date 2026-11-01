@@ -22,7 +22,7 @@ const voiceIndex = model.add_voice(voiceBytes);
 await model.flush();
 
 // Splits and tokenizes. Runs no model, and returns the number of chunks.
-model.start_generation(voiceIndex, text, temperature, seed);
+model.start_generation(voiceIndex, text, temperature, seed, false);
 
 while (true) {
   // Prompts the next chunk's text, or returns undefined once every chunk is done.
@@ -33,7 +33,11 @@ while (true) {
     // each, or undefined at the end of the chunk. One frame on the CPU, up to four on WebGPU.
     const pcm = await model.generation_step();
     if (!pcm) break;
-    // ... play or buffer pcm ...
+    // With timings requested, the words this step fixed. Empty otherwise, and the rows
+    // they came from were in the same readback as `pcm`, so a WebGPU step is still one
+    // round trip.
+    const words = model.take_word_timings();
+    // ... play or buffer pcm, and highlight words ...
   }
 }
 ```

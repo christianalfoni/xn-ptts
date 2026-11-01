@@ -262,12 +262,15 @@ export class PhononTTS {
    * @returns {import('./index.js').SpeechStream}
    */
   stream(text, options = {}) {
-    const { voice = this.#defaultVoice, temperature = 0.3, signal } = options;
+    const { voice = this.#defaultVoice, temperature = 0.3, signal, timings = false } = options;
     const seed = toSeed(options.seed ?? DEFAULT_SEED);
     const id = this.#nextId++;
     // Chunks the consumer has not taken yet, and the consumer waiting for the next one.
     const buffered = [];
     let waiting = null;
+    const wordBuffer = [];
+    let waitingWords = null;
+    const allWords = [];
     let finished = false;
     let failure = null;
     let started = false;
@@ -283,13 +286,20 @@ export class PhononTTS {
       waiting = null;
       w?.();
     };
+    const wakeWords = () => {
+      const w = waitingWords;
+      waitingWords = null;
+      w?.();
+    };
     const finish = (err, stats) => {
       if (finished) return;
       finished = true;
       failure = err;
       signal?.removeEventListener('abort', cancel);
+      if (stats && timings && !err) stats.words = allWords;
       err ? rejectDone(err) : resolveDone(stats);
       wake();
+      wakeWords();
     };
     const cancel = () => {
       buffered.length = 0;
@@ -302,8 +312,15 @@ export class PhononTTS {
     else signal?.addEventListener('abort', cancel, { once: true });
 
     const handlers = {
-      chunk: ({ pcm }) => {
+      chunk: ({ pcm, words }) => {
         if (cancelled) return;
+        if (words?.length) {
+          for (const word of words) {
+            allWords.push(word);
+            wordBuffer.push(word);
+          }
+          wakeWords();
+        }
         buffered.push(pcm);
         wake();
       },
@@ -323,7 +340,7 @@ export class PhononTTS {
         if (finished || this.#disposed) return finish(this.#disposed ? this.#endError() : null, { cancelled: true });
         started = true;
         this.#pending.set(id, handlers);
-        this.#worker.postMessage({ type: 'generate', id, text, voice, temperature, seed });
+        this.#worker.postMessage({ type: 'generate', id, text, voice, temperature, seed, timings });
       });
     this.#queue = this.#queue.then(run, run);
 
@@ -331,6 +348,18 @@ export class PhononTTS {
       sampleRate: this.sampleRate,
       done,
       cancel,
+      // Words whose end time is known, in order. Empty, and already finished once `done`
+      // resolves, when timings were not requested. Stopping this iterator does not stop
+      // the audio: only the audio iterator, or `cancel`, does that.
+      words: {
+        async *[Symbol.asyncIterator]() {
+          for (;;) {
+            if (wordBuffer.length) yield wordBuffer.shift();
+            else if (finished) return;
+            else await new Promise((w) => (waitingWords = w));
+          }
+        },
+      },
       async *[Symbol.asyncIterator]() {
         try {
           for (;;) {
