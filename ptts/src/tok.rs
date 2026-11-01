@@ -33,6 +33,16 @@ impl crate::Tokenizer for Tok {
     fn decode(&self, ids: &[u32]) -> xn::Result<String> {
         self.0.decode(ids, true).map_err(xn::Error::wrap)
     }
+
+    fn encode_spans(&self, text: &str) -> xn::Result<Vec<(u32, usize, usize)>> {
+        let encoded = self.0.encode(text, false).map_err(xn::Error::wrap)?;
+        Ok(encoded
+            .get_ids()
+            .iter()
+            .zip(encoded.get_offsets())
+            .map(|(&id, &(start, end))| (id, start, end))
+            .collect())
+    }
 }
 
 #[cfg(test)]
