@@ -118,6 +118,11 @@ struct Args {
     /// and the rules only read `en`, `fr`, `de`, `es` and `pt`.
     #[arg(long, default_value = "default")]
     rewrites: String,
+
+    /// Write word timings as JSON. Each entry is a word of the text, its character offsets
+    /// into that text, and the seconds at which it is spoken, from the start of the audio.
+    #[arg(long, value_name = "PATH")]
+    word_timings: Option<std::path::PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -183,7 +188,7 @@ fn main() -> Result<()> {
     checkpoint.register_voices(&mut tts);
     tracing::info!(device = %tts.device_name(), voices = ?tts.voices(), languages = ?tts.languages(), "model loaded");
 
-    let mut opts = SpeechOptions::default();
+    let mut opts = SpeechOptions::default().timings(args.word_timings.is_some());
     match &voice {
         VoiceArg::Default => {}
         VoiceArg::Bundled(name) => {
@@ -225,11 +230,17 @@ fn main() -> Result<()> {
     };
 
     let sample_rate = stream.sample_rate();
+    let mut stream = stream;
     let mut pcm = Vec::new();
     let mut first_chunk_ms = None;
-    for chunk in stream {
+    for chunk in stream.by_ref() {
         pcm.extend_from_slice(&chunk?);
         first_chunk_ms.get_or_insert_with(|| start.elapsed().as_secs_f64() * 1000.0);
+    }
+    if let Some(path) = &args.word_timings {
+        let json = serde_json::to_string_pretty(stream.word_timings())?;
+        std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))?;
+        tracing::info!(words = stream.word_timings().len(), "wrote {}", path.display());
     }
 
     let elapsed = start.elapsed().as_secs_f64();
