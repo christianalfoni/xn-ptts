@@ -48,13 +48,15 @@ class FakeWorker {
       this.run(msg);
     }
   }
-  async run({ id }) {
+  async run(msg) {
+    const { id } = msg;
     const { frames, fail } = FakeWorker.script;
     let sent = 0;
     for (; sent < frames; sent++) {
       await new Promise((r) => setTimeout(r, 1));
       if (this.cancelled.has(id)) break;
-      this.reply({ type: 'chunk', id, pcm: new Float32Array(4).fill(sent) });
+      const words = msg.timings ? [{ word: 'Hello', start: 0, end: 5, from: sent * 0.08, to: (sent + 1) * 0.08 }] : undefined;
+      this.reply({ type: 'chunk', id, pcm: new Float32Array(4).fill(sent), words });
     }
     await new Promise((r) => setTimeout(r, 1));
     if (fail) this.reply({ type: 'error', id, message: fail });
@@ -273,7 +275,27 @@ test('stream yields every frame in order, then its stats', async () => {
   for await (const pcm of stream) seen.push(pcm[0]);
   assert.deepEqual(seen, [0, 1, 2]);
   assert.equal((await stream.done).frames, 3);
+  assert.equal((await stream.done).words, undefined);
   assert.equal(FakeWorker.last.generations[0].voice, 'alba', 'the default voice');
+  assert.equal(FakeWorker.last.generations[0].timings, false);
+});
+
+test('timings arrive beside the frames and again on done, and the frames stay PCM', async () => {
+  FakeWorker.script = { frames: 2, fail: null };
+  const tts = await load();
+  const stream = tts.stream('Hello.', { timings: true });
+  const seen = [];
+  const words = [];
+  const audio = (async () => {
+    for await (const pcm of stream) seen.push(pcm[0]);
+  })();
+  for await (const word of stream.words) words.push(word.word);
+  await audio;
+  const stats = await stream.done;
+  assert.deepEqual(seen, [0, 1]);
+  assert.deepEqual(words, ['Hello', 'Hello']);
+  assert.deepEqual(stats.words.map((word) => [word.start, word.end, word.from]), [[0, 5, 0], [0, 5, 0.08]]);
+  assert.equal(FakeWorker.last.generations.at(-1).timings, true);
 });
 
 test('the seed defaults to the one Rust and Python use, and goes out as a bigint', async () => {
